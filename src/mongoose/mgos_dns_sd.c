@@ -123,20 +123,54 @@ static void add_nsec_record(struct mg_dns_reply *reply, struct mg_str name,
   reply->msg->num_answers++;
 }
 
-static void add_a_record(struct mg_dns_reply *reply, struct mg_str name,
-                         bool naive_client, int ttl, struct mbuf *rdata) {
-  uint32_t addr = 0;
+static void add_a_record(struct mg_connection *nc, struct mg_dns_reply *reply,
+                         struct mg_str name, bool naive_client, int ttl,
+                         struct mbuf *rdata) {
+  in_addr_t addr = 0;
   struct mgos_net_ip_info ip_info;
+  char str_ip[16];
+  (void) str_ip;
+
+  LOG(LL_DEBUG, ("Connection sa %s", mgos_net_ip_to_str(&nc->sa.sin, str_ip)));
+
+  // check from which interface the request came
 #ifdef MGOS_HAVE_WIFI
   if (mgos_net_get_ip_info(MGOS_NET_IF_TYPE_WIFI, MGOS_NET_IF_WIFI_STA,
                            &ip_info)) {
-    addr = ip_info.ip.sin_addr.s_addr;
-  } else if (mgos_net_get_ip_info(MGOS_NET_IF_TYPE_WIFI, MGOS_NET_IF_WIFI_AP,
-                                  &ip_info)) {
-    addr = ip_info.ip.sin_addr.s_addr;
+    LOG(LL_DEBUG, ("WiFi STA address %08x, mask %08x",
+                  ip_info.ip.sin_addr.s_addr, ip_info.netmask.sin_addr.s_addr));
+    LOG(LL_DEBUG, ("ip_info.ip %s", mgos_net_ip_to_str(&ip_info.ip, str_ip)));
+
+    if ((ip_info.ip.sin_addr.s_addr & ip_info.netmask.sin_addr.s_addr) ==
+        (nc->sa.sin.sin_addr.s_addr & ip_info.netmask.sin_addr.s_addr)) {
+      addr = ip_info.ip.sin_addr.s_addr;
+    }
   }
-#else
-  (void) ip_info;
+  if (mgos_net_get_ip_info(MGOS_NET_IF_TYPE_WIFI, MGOS_NET_IF_WIFI_AP,
+                           &ip_info)) {
+    LOG(LL_DEBUG, ("WiFi AP address %08x, mask %08x", ip_info.ip.sin_addr.s_addr,
+                  ip_info.netmask.sin_addr.s_addr));
+    LOG(LL_DEBUG, ("ip_info.ip %s", mgos_net_ip_to_str(&ip_info.ip, str_ip)));
+
+    if ((ip_info.ip.sin_addr.s_addr & ip_info.netmask.sin_addr.s_addr) ==
+        (nc->sa.sin.sin_addr.s_addr & ip_info.netmask.sin_addr.s_addr)) {
+      addr = ip_info.ip.sin_addr.s_addr;
+    }
+  }
+#endif
+#ifdef MGOS_HAVE_ETHERNET
+  if (mgos_net_get_ip_info(MGOS_NET_IF_TYPE_ETHERNET, 0, &ip_info)) {
+    LOG(LL_DEBUG, ("Ethernet address %08x, mask %08x",
+                  ip_info.ip.sin_addr.s_addr, ip_info.netmask.sin_addr.s_addr));
+    LOG(LL_DEBUG, ("ip_info.ip %s", mgos_net_ip_to_str(&ip_info.ip, str_ip)));
+
+    if ((ip_info.ip.sin_addr.s_addr & ip_info.netmask.sin_addr.s_addr) ==
+        (nc->sa.sin.sin_addr.s_addr & ip_info.netmask.sin_addr.s_addr)) {
+      // Favour Ethernet over STA if connected to the same network
+      // this will overwrite the addr variable
+      addr = ip_info.ip.sin_addr.s_addr;
+    }
+  }
 #endif
   if (addr != 0) {
     struct mg_dns_resource_record rr =
@@ -223,15 +257,15 @@ static void add_instance_records(struct mg_dns_reply *reply,
   }
 }
 
-static void advertise(struct mg_dns_reply *reply, bool naive_client, int ttl,
-                      struct mbuf *rdata) {
+static void advertise(struct mg_connection *nc, struct mg_dns_reply *reply,
+                      bool naive_client, int ttl, struct mbuf *rdata) {
   add_service_records(reply, ttl, rdata);
   struct mgos_dns_sd_service_entry *e = NULL;
   SLIST_FOREACH(e, &s_instances, next) {
     add_instance_records(reply, e, true, true, true, ttl, rdata);
   }
   /* host A ip */
-  add_a_record(reply, s_host_name, naive_client, ttl, rdata);
+  add_a_record(nc, reply, s_host_name, naive_client, ttl, rdata);
   add_nsec_record(reply, s_host_name, naive_client, ttl, rdata);
 }
 
@@ -292,7 +326,7 @@ static void handler(struct mg_connection *nc, int ev, void *ev_data,
 
         if (rr->rtype == MG_DNS_PTR_RECORD &&
             mg_strcasecmp(name, mg_mk_str(SD_TYPE_ENUM_NAME)) == 0) {
-          advertise(&reply, naive_client, mgos_sys_config_get_dns_sd_ttl(),
+          advertise(nc, &reply, naive_client, mgos_sys_config_get_dns_sd_ttl(),
                     &rdata);
           have_a = true;
         } else if ((rr->rtype == MG_DNS_A_RECORD ||
@@ -319,7 +353,7 @@ static void handler(struct mg_connection *nc, int ev, void *ev_data,
         }
       }
       if (need_a && !have_a) {
-        add_a_record(&reply, s_host_name, naive_client, ttl, &rdata);
+        add_a_record(nc, &reply, s_host_name, naive_client, ttl, &rdata);
         add_nsec_record(&reply, s_host_name, naive_client, ttl, &rdata);
       }
 
@@ -353,7 +387,7 @@ static void dns_sd_advertise(struct mg_connection *c, int ttl) {
   msg.flags = 0x8400;
   reply = mg_dns_create_reply(&mbuf1, &msg);
   reset_flags();
-  advertise(&reply, false /* naive_client */, ttl, &mbuf2);
+  advertise(c, &reply, false /* naive_client */, ttl, &mbuf2);
   if (msg.num_answers > 0) {
     LOG(LL_DEBUG, ("sending adv as M, size %d", (int) reply.io->len));
     mg_dns_send_reply(c, &reply);
@@ -369,7 +403,9 @@ static void dns_sd_adv_timer_cb(void *arg) {
 
 static void dns_sd_net_ev_handler(int ev, void *evd, void *arg) {
   struct mg_connection *c = mgos_mdns_get_listener();
-  LOG(LL_DEBUG, ("ev %d, data %p, mdns_listener %p", ev, arg, c));
+  struct mgos_net_event_data *evd2 = evd;
+  LOG(LL_DEBUG, ("ev %d, if_type %d, if_instance %d, data %p, mdns_listener %p",
+                ev, evd2->if_type, evd2->if_instance, arg, c));
   if (ev == MGOS_NET_EV_IP_ACQUIRED && c != NULL) {
     mgos_dns_sd_advertise();
     mgos_set_timer(1000, 0, dns_sd_adv_timer_cb, NULL); /* By RFC, repeat */
@@ -468,16 +504,6 @@ bool mgos_dns_sd_remove_service_instance(const char *name, const char *proto,
 /* Initialize the DNS-SD subsystem */
 bool mgos_dns_sd_init(void) {
   if (!mgos_sys_config_get_dns_sd_enable()) return true;
-#ifdef MGOS_HAVE_WIFI
-  if (mgos_sys_config_get_wifi_ap_enable() &&
-      mgos_sys_config_get_wifi_sta_enable() &&
-      mgos_sys_config_get_wifi_ap_keep_enabled()) {
-    /* Reason: multiple interfaces. More work is required to make sure
-     * requests and responses are correctly plumbed to the right interface. */
-    LOG(LL_ERROR, ("MDNS does not work in AP+STA mode"));
-    return true;
-  }
-#endif
   if (!mgos_mdns_init()) return false;
   mgos_mdns_add_handler(handler, NULL);
   mgos_event_add_group_handler(MGOS_EVENT_GRP_NET, dns_sd_net_ev_handler, NULL);
